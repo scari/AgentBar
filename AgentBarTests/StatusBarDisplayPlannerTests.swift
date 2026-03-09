@@ -59,6 +59,44 @@ final class StatusBarDisplayPlannerTests: XCTestCase {
         XCTAssertEqual(StatusBarDisplayPlanner.maxScrollIndex(for: ranked), 0)
     }
 
+    func testUsesTwoVisibleRowsWhenOneOrTwoServicesAreActive() {
+        XCTAssertEqual(StatusBarDisplayPlanner.visibleRowCount(forServiceCount: 1), 2)
+        XCTAssertEqual(StatusBarDisplayPlanner.visibleRowCount(forServiceCount: 2), 2)
+        XCTAssertEqual(StatusBarDisplayPlanner.visibleRowCount(forServiceCount: 3), 3)
+    }
+
+    func testCompactLayoutUsesHalfHeightRows() {
+        XCTAssertEqual(
+            StatusBarDisplayPlanner.rowHeight(forServiceCount: 2),
+            7.6,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            StatusBarDisplayPlanner.rowHeight(forServiceCount: 3),
+            6,
+            accuracy: 0.001
+        )
+    }
+
+    func testCompactLayoutUsesEvenVerticalSpacing() {
+        XCTAssertEqual(
+            StatusBarDisplayPlanner.rowSpacing(forServiceCount: 2),
+            1.6,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            StatusBarDisplayPlanner.rowSpacing(forServiceCount: 3),
+            1,
+            accuracy: 0.001
+        )
+    }
+
+    func testCompactLayoutCentersRowsVertically() {
+        XCTAssertTrue(StatusBarDisplayPlanner.centersRowsVertically(forServiceCount: 1))
+        XCTAssertTrue(StatusBarDisplayPlanner.centersRowsVertically(forServiceCount: 2))
+        XCTAssertFalse(StatusBarDisplayPlanner.centersRowsVertically(forServiceCount: 3))
+    }
+
     func testMaxScrollIndexEqualsOverflowRowCount() {
         let services = [
             makeUsage(service: .claude, fiveHourPct: 0.99),

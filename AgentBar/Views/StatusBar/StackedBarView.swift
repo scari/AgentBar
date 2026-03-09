@@ -11,6 +11,18 @@ struct StackedBarView: View {
         StatusBarDisplayPlanner.rankedServices(from: services)
     }
 
+    private var rowHeight: CGFloat {
+        StatusBarDisplayPlanner.rowHeight(forServiceCount: rankedServices.count)
+    }
+
+    private var rowSpacing: CGFloat {
+        StatusBarDisplayPlanner.rowSpacing(forServiceCount: rankedServices.count)
+    }
+
+    private var shouldCenterRowsVertically: Bool {
+        StatusBarDisplayPlanner.centersRowsVertically(forServiceCount: rankedServices.count)
+    }
+
     private var cycleTaskID: String {
         let signature = rankedServices
             .map { usage in
@@ -52,19 +64,22 @@ struct StackedBarView: View {
     }
 
     private var scrollingRows: some View {
-        ZStack(alignment: .top) {
-            VStack(spacing: StatusBarDisplayPlanner.rowSpacing) {
+        ZStack(alignment: shouldCenterRowsVertically ? .center : .top) {
+            VStack(spacing: rowSpacing) {
                 ForEach(rankedServices) { usage in
                     SingleBarView(usage: usage)
-                        .frame(height: StatusBarDisplayPlanner.rowHeight)
+                        .frame(height: rowHeight)
                 }
             }
             .offset(
                 y: -CGFloat(currentScrollIndex)
-                    * (StatusBarDisplayPlanner.rowHeight + StatusBarDisplayPlanner.rowSpacing)
+                    * (rowHeight + rowSpacing)
             )
         }
-        .frame(height: StatusBarDisplayPlanner.viewportHeight, alignment: .top)
+        .frame(
+            height: StatusBarDisplayPlanner.viewportHeight,
+            alignment: shouldCenterRowsVertically ? .center : .top
+        )
         .clipped()
     }
 
@@ -143,6 +158,5 @@ struct SingleBarView: View {
                 }
             }
         }
-        .frame(height: StatusBarDisplayPlanner.rowHeight)
     }
 }
