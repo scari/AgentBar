@@ -2,18 +2,24 @@ import XCTest
 @testable import AgentBar
 
 final class ClaudeUsageProviderTests: XCTestCase {
+    private var originalCredentialsFileURLProvider: (@Sendable () -> URL)!
+    private var originalCredentialsFileReader: (@Sendable (URL) -> String?)!
     private var originalSecurityCLIRunner: (@Sendable (TimeInterval) -> String?)!
 
     override func setUp() {
         super.setUp()
         MockURLProtocol.reset()
         ClaudeUsageProvider.resetTokenCache()
+        originalCredentialsFileURLProvider = ClaudeUsageProvider.credentialsFileURLProvider
+        originalCredentialsFileReader = ClaudeUsageProvider.credentialsFileReader
         originalSecurityCLIRunner = ClaudeUsageProvider.securityCLIRunner
     }
 
     override func tearDown() {
         MockURLProtocol.reset()
         ClaudeUsageProvider.resetTokenCache()
+        ClaudeUsageProvider.credentialsFileURLProvider = originalCredentialsFileURLProvider
+        ClaudeUsageProvider.credentialsFileReader = originalCredentialsFileReader
         ClaudeUsageProvider.securityCLIRunner = originalSecurityCLIRunner
         super.tearDown()
     }
@@ -419,6 +425,60 @@ final class ClaudeUsageProviderTests: XCTestCase {
         XCTAssertNil(ClaudeUsageProvider.readKeychainTokenViaCLI(now: now, cacheTTL: 60))
         XCTAssertNil(ClaudeUsageProvider.readKeychainTokenViaCLI(now: now.addingTimeInterval(5), cacheTTL: 60))
         XCTAssertEqual(counter.value, 1)
+    }
+
+    func testReadAccessTokenPrefersCredentialsFile() {
+        ClaudeUsageProvider.credentialsFileURLProvider = {
+            URL(fileURLWithPath: "/tmp/test-claude-credentials.json")
+        }
+        ClaudeUsageProvider.credentialsFileReader = { _ in
+            """
+            {"claudeAiOauth":{"accessToken":"file-token"}}
+            """
+        }
+        ClaudeUsageProvider.securityCLIRunner = { _ in
+            XCTFail("Should not read keychain when file credentials are present")
+            return nil
+        }
+
+        XCTAssertEqual(ClaudeUsageProvider.readAccessToken(), "file-token")
+    }
+
+    func testReadAccessTokenFallsBackToKeychainWhenFileMissing() {
+        ClaudeUsageProvider.credentialsFileReader = { _ in nil }
+        ClaudeUsageProvider.securityCLIRunner = { _ in
+            """
+            {"claudeAiOauth":{"accessToken":"keychain-token"}}
+            """
+        }
+
+        XCTAssertEqual(ClaudeUsageProvider.readAccessToken(), "keychain-token")
+    }
+
+    func testReadAccessTokenFallsBackToKeychainWhenFileIsMalformed() {
+        ClaudeUsageProvider.credentialsFileReader = { _ in "not json" }
+        ClaudeUsageProvider.securityCLIRunner = { _ in
+            """
+            {"claudeAiOauth":{"accessToken":"keychain-token"}}
+            """
+        }
+
+        XCTAssertEqual(ClaudeUsageProvider.readAccessToken(), "keychain-token")
+    }
+
+    func testDefaultCredentialProviderUsesFileCredentials() async {
+        let defaults = makeDefaultsSuite()
+        ClaudeUsageProvider.credentialsFileReader = { _ in
+            """
+            {"claudeAiOauth":{"accessToken":"file-token"}}
+            """
+        }
+        ClaudeUsageProvider.securityCLIRunner = { _ in nil }
+
+        let provider = ClaudeUsageProvider(defaults: defaults)
+
+        let isConfigured = await provider.isConfigured()
+        XCTAssertTrue(isConfigured)
     }
 
     func testExecuteSecurityCLICommandTimeoutForceKillsIfStillRunning() {
