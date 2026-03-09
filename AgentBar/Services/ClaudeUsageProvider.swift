@@ -73,6 +73,7 @@ final class ClaudeUsageProvider: UsageProviderProtocol, @unchecked Sendable {
 
     static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
 
+    private static let credentialsFileRelativePath = ".claude/.credentials.json"
     private static let keychainService = "Claude Code-credentials"
     private static let tokenCacheLock = NSLock()
     private static let defaultCacheTTL: TimeInterval = 60
@@ -80,6 +81,13 @@ final class ClaudeUsageProvider: UsageProviderProtocol, @unchecked Sendable {
     nonisolated(unsafe) private static var cachedToken: String?
     nonisolated(unsafe) private static var tokenLastLookupAt: Date?
     typealias SecurityCLIProcessRuntime = CLIProcessRuntime
+    nonisolated(unsafe) static var credentialsFileURLProvider: @Sendable () -> URL = {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(credentialsFileRelativePath)
+    }
+    nonisolated(unsafe) static var credentialsFileReader: @Sendable (_ url: URL) -> String? = { url in
+        try? String(contentsOf: url, encoding: .utf8)
+    }
     nonisolated(unsafe) static var securityCLIRunner: @Sendable (_ timeout: TimeInterval) -> String? = { timeout in
         runSecurityCLICommand(timeout: timeout)
     }
@@ -90,7 +98,7 @@ final class ClaudeUsageProvider: UsageProviderProtocol, @unchecked Sendable {
         defaults: UserDefaults = .standard
     ) {
         self.session = session
-        self.credentialProvider = credentialProvider ?? { Self.readKeychainTokenViaCLI() }
+        self.credentialProvider = credentialProvider ?? { Self.readAccessToken() }
         self.defaults = defaults
     }
 
@@ -259,6 +267,16 @@ final class ClaudeUsageProvider: UsageProviderProtocol, @unchecked Sendable {
     }
 
     // MARK: - Keychain Access via security CLI
+
+    static func readAccessToken() -> String? {
+        readTokenFromCredentialsFile() ?? readKeychainTokenViaCLI()
+    }
+
+    static func readTokenFromCredentialsFile() -> String? {
+        let url = credentialsFileURLProvider()
+        guard let rawJSON = credentialsFileReader(url) else { return nil }
+        return parseAccessToken(from: rawJSON)
+    }
 
     /// Reads the Claude Code OAuth token using the `security` CLI to avoid
     /// per-app Keychain ACL prompts. The result is cached with a TTL matching
