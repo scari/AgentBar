@@ -73,9 +73,10 @@ write_if_changed() {
   echo "Updated: ${target}"
 }
 
-install_codex_hook() {
-  local rendered
-  rendered="$(python3 - "$CODEX_CONFIG" "$CODEX_HOOK_SCRIPT" <<'PY'
+render_codex_config() {
+  local target="$1"
+  local hook_script="$2"
+  python3 - "$target" "$hook_script" <<'PY'
 import os
 import re
 import sys
@@ -92,7 +93,7 @@ if os.path.exists(path):
 # Always keep notify at top-level:
 # 1) Remove existing notify assignments (possibly nested in tables),
 # 2) Insert once before the first table header.
-cleaned = re.sub(r"(?m)^\s*notify\s*=.*$(?:\n)?", "", text)
+cleaned = re.sub(r"(?m)^\s*notify\s*=.*$\n?", "", text)
 lines = cleaned.splitlines()
 insert_index = len(lines)
 for i, line in enumerate(lines):
@@ -105,7 +106,11 @@ new_text = "\n".join(lines).rstrip("\n") + "\n"
 
 sys.stdout.write(new_text)
 PY
-)"
+}
+
+install_codex_hook() {
+  local rendered
+  rendered="$(render_codex_config "$CODEX_CONFIG" "$CODEX_HOOK_SCRIPT")"
 
   write_if_changed "$CODEX_CONFIG" "$rendered"
 }
@@ -180,9 +185,10 @@ install_claude_hook() {
   write_if_changed "$CLAUDE_HOOKS_CONFIG" "$rendered"
 }
 
-install_gemini_hook() {
-  local rendered
-  rendered="$(python3 - "$GEMINI_SETTINGS" "$GEMINI_HOOK_SCRIPT" <<'PY'
+render_gemini_settings() {
+  local target="$1"
+  local hook_script="$2"
+  python3 - "$target" "$hook_script" <<'PY'
 import json
 import os
 import sys
@@ -257,7 +263,11 @@ hooks["Notification"] = notification
 data["hooks"] = hooks
 sys.stdout.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
 PY
-)"
+}
+
+install_gemini_hook() {
+  local rendered
+  rendered="$(render_gemini_settings "$GEMINI_SETTINGS" "$GEMINI_HOOK_SCRIPT")"
 
   write_if_changed "$GEMINI_SETTINGS" "$rendered"
 }
