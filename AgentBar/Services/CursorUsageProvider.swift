@@ -149,7 +149,9 @@ final class CursorUsageProvider: UsageProviderProtocol, @unchecked Sendable {
             "endDate": String(Int(Date().timeIntervalSince1970 * 1000))
         ]
 
-        var request = URLRequest(url: url, timeoutInterval: 10)
+        // Aggregating a full billing period of usage events is slow on a cold
+        // request, so allow more time than the lightweight legacy call.
+        var request = URLRequest(url: url, timeoutInterval: 30)
         request.httpMethod = "POST"
         request.setValue("WorkosCursorSessionToken=\(cookie)", forHTTPHeaderField: "Cookie")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
