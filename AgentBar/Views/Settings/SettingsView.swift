@@ -38,7 +38,7 @@ struct SettingsView: View {
 
     @AppStorage("cursorEnabled") private var cursorEnabled = true
     @AppStorage("cursorPlan") private var cursorPlan: String = CursorPlan.pro.rawValue
-    @AppStorage("cursorMonthlyLimit") private var cursorMonthlyLimit: Double = 500
+    @AppStorage("cursorMonthlyLimit") private var cursorMonthlyLimit: Double = CursorPlan.pro.monthlyUsageLimitUSD
 
     @AppStorage("zaiEnabled") private var zaiEnabled = true
     @AppStorage(BuyMeACoffeeSettings.hideButtonKey) private var hideBuyMeACoffeeButton = false
@@ -270,17 +270,17 @@ struct SettingsView: View {
                 }
                 .onChange(of: cursorPlan) { newValue in
                     if let plan = CursorPlan(rawValue: newValue), plan != .custom {
-                        cursorMonthlyLimit = plan.monthlyRequestEstimate
+                        cursorMonthlyLimit = plan.monthlyUsageLimitUSD
                     }
                     notifyLimitsChanged()
                 }
 
                 HStack {
-                    Text("Est. monthly requests:")
+                    Text("Est. monthly usage:")
                     TextField("", value: $cursorMonthlyLimit, format: .number)
                         .frame(width: 120)
                         .disabled(cursorPlan != CursorPlan.custom.rawValue)
-                    Text("requests")
+                    Text("USD")
                         .foregroundStyle(.secondary)
                 }
                 .onChange(of: cursorMonthlyLimit) { _ in
@@ -289,7 +289,7 @@ struct SettingsView: View {
                     }
                 }
 
-                Text("Credit-based pricing since June 2025. Actual limit varies by model. Token is auto-read from Cursor's local database.")
+                Text("Credit-based pricing since June 2025. Usage is the dollar value of model usage in the current billing period; the included allotment is an estimate. Token is auto-read from Cursor's local database.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -644,7 +644,7 @@ struct SettingsView: View {
 
         cursorPlan = resolvedPlan.rawValue
         if resolvedPlan != .custom {
-            cursorMonthlyLimit = resolvedPlan.monthlyRequestEstimate
+            cursorMonthlyLimit = resolvedPlan.monthlyUsageLimitUSD
         }
     }
 

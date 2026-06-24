@@ -164,7 +164,7 @@ final class UsageViewModel: ObservableObject {
 
         if isEnabled("cursorEnabled", in: defaults) {
             providers.append(CursorUsageProvider(
-                monthlyRequestLimit: cursorMonthlyLimit(in: defaults)
+                monthlyUsageLimitUSD: cursorUsageLimitUSD(in: defaults)
             ))
         }
 
@@ -197,12 +197,12 @@ final class UsageViewModel: ObservableObject {
         defaults.double(forKey: "geminiDailyLimit").nonZero ?? 1_000
     }
 
-    private static func cursorMonthlyLimit(in defaults: UserDefaults) -> Double {
+    private static func cursorUsageLimitUSD(in defaults: UserDefaults) -> Double {
         let plan = CursorPlan.resolveAndMigrateStoredPlan(in: defaults)
         if plan == .custom {
-            return defaults.double(forKey: "cursorMonthlyLimit").nonZero ?? CursorPlan.pro.monthlyRequestEstimate
+            return defaults.double(forKey: "cursorMonthlyLimit").nonZero ?? CursorPlan.pro.monthlyUsageLimitUSD
         }
-        return plan.monthlyRequestEstimate
+        return plan.monthlyUsageLimitUSD
     }
 }
 

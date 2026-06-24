@@ -47,15 +47,20 @@ enum CursorPlan: String, CaseIterable, Codable, Sendable {
     case teams = "Teams"
     case custom = "Custom"
 
-    /// Approximate monthly premium request estimate (varies by model).
-    /// Claude Sonnet ~225, GPT-5 ~500, Gemini ~550 per $20.
-    var monthlyRequestEstimate: Double {
+    /// Approximate monthly included-usage allotment, in US dollars.
+    ///
+    /// Since June 2025 Cursor bills on credit/usage-based pricing rather than a
+    /// premium-request count, so usage is tracked as the dollar value of model
+    /// usage consumed. These figures estimate each plan's included allotment
+    /// (Ultra includes ~20x Pro); users on `.custom` can override the limit in
+    /// Settings.
+    var monthlyUsageLimitUSD: Double {
         switch self {
-        case .free: return 50
-        case .pro: return 500
-        case .proPlus: return 1500
-        case .ultra: return 5000
-        case .teams: return 1000
+        case .free: return 0
+        case .pro: return 20
+        case .proPlus: return 60
+        case .ultra: return 400
+        case .teams: return 40
         case .custom: return 0
         }
     }

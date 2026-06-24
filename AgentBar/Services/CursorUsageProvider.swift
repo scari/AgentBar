@@ -3,32 +3,33 @@ import SQLite3
 
 // MARK: - API Response Models
 
+/// Legacy `/api/usage` response.
+///
+/// Cursor froze the per-model request counters (`numRequests`, `numTokens`, …) at 0
+/// when it moved to credit/usage-based pricing in June 2025, so we only read
+/// `startOfMonth` from this endpoint to anchor the billing period. Real usage comes
+/// from `dashboard/get-aggregated-usage-events`.
 struct CursorUsageResponse: Decodable, Sendable {
     let startOfMonth: String?
-    let modelUsages: [String: CursorModelUsage]
-
-    init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: DynamicCodingKey.self)
-        let startOfMonthKey = DynamicCodingKey(stringValue: "startOfMonth")!
-        startOfMonth = try container.decodeIfPresent(String.self, forKey: startOfMonthKey)
-
-        var decodedModelUsages: [String: CursorModelUsage] = [:]
-        for key in container.allKeys where key.stringValue != "startOfMonth" {
-            if let usage = try? container.decode(CursorModelUsage.self, forKey: key) {
-                decodedModelUsages[key.stringValue] = usage
-            }
-        }
-        modelUsages = decodedModelUsages
-    }
-
-    var allModelUsages: [CursorModelUsage] {
-        Array(modelUsages.values)
-    }
 }
 
-struct CursorModelUsage: Decodable, Sendable {
-    let numRequests: Int?
-    let maxRequestUsage: Int?
+/// `dashboard/get-aggregated-usage-events` response — the authoritative usage source
+/// under Cursor's credit-based pricing. `totalCostCents / 100` is the dollar spend the
+/// Cursor dashboard shows for the queried window.
+struct CursorAggregatedUsageResponse: Decodable, Sendable {
+    struct Aggregation: Decodable, Sendable {
+        let totalCents: Double?
+    }
+
+    let totalCostCents: Double?
+    let aggregations: [Aggregation]?
+
+    /// Spend in cents for the window. Prefers the server-provided total and falls
+    /// back to summing the per-model aggregations if it is absent.
+    var resolvedCents: Double {
+        if let totalCostCents { return totalCostCents }
+        return (aggregations ?? []).compactMap(\.totalCents).reduce(0, +)
+    }
 }
 
 // MARK: - Provider
@@ -37,23 +38,32 @@ final class CursorUsageProvider: UsageProviderProtocol, @unchecked Sendable {
     let serviceType: ServiceType = .cursor
 
     private let session: URLSession
-    private let monthlyRequestLimit: Double
+    private let monthlyUsageLimitUSD: Double
     private let dbPathProvider: @Sendable () -> String
     private let defaults: UserDefaults
 
+    /// Legacy endpoint, kept only for the `startOfMonth` billing anchor.
     static let apiBaseURL = "https://www.cursor.com/api/usage"
+    /// Current usage endpoint (credit-based pricing).
+    static let aggregatedUsageURL = "https://cursor.com/api/dashboard/get-aggregated-usage-events"
+    /// Required `Origin` for the dashboard endpoint; without it the API responds 403
+    /// "Invalid origin for state-changing request".
+    static let dashboardOrigin = "https://cursor.com"
+
+    private static let cacheKey = "cursorUsageCache.monthly"
+
     static let defaultDBPath: String = {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return "\(home)/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
     }()
 
     init(
-        monthlyRequestLimit: Double = CursorPlan.pro.monthlyRequestEstimate,
+        monthlyUsageLimitUSD: Double = CursorPlan.pro.monthlyUsageLimitUSD,
         session: URLSession = .shared,
         dbPathProvider: (@Sendable () -> String)? = nil,
         defaults: UserDefaults = .standard
     ) {
-        self.monthlyRequestLimit = monthlyRequestLimit
+        self.monthlyUsageLimitUSD = monthlyUsageLimitUSD
         self.session = session
         self.dbPathProvider = dbPathProvider ?? { Self.defaultDBPath }
         self.defaults = defaults
@@ -74,22 +84,48 @@ final class CursorUsageProvider: UsageProviderProtocol, @unchecked Sendable {
     private func fetchUsageFromAPI() async throws -> UsageData {
         let dbPath = dbPathProvider()
 
-        // 1. Read JWT from SQLite
+        // 1. Read JWT from SQLite and derive the user id.
         let jwt = try readAccessToken(from: dbPath)
-
-        // 2. Decode JWT to extract user ID
         let userId = try Self.decodeUserIdFromJWT(jwt)
+        let cookie = Self.sessionCookie(userId: userId, jwt: jwt)
 
-        // 3. Call Cursor usage API
+        // 2. Anchor the billing period via the legacy endpoint. Its request counters are
+        //    always 0 under credit-based pricing, so only `startOfMonth` is used.
+        let legacy = try await fetchLegacyUsage(userId: userId, cookie: cookie)
+        let periodStart = legacy.startOfMonth.flatMap(DateUtils.parseISO8601)
+            ?? Self.startOfCurrentMonthUTC()
+        let resetTime = legacy.startOfMonth.flatMap(Self.parseStartOfMonthReset)
+            ?? CopilotUsageProvider.firstOfNextMonthUTC()
+
+        // 3. Real usage: dollars spent this period from aggregated usage events.
+        let spentCents = try await fetchAggregatedSpendCents(cookie: cookie, since: periodStart)
+
+        let metric = UsageMetric(
+            used: spentCents / 100.0,
+            total: monthlyUsageLimitUSD,
+            unit: .dollars,
+            resetTime: resetTime
+        )
+        saveMetricCache(metric, forKey: Self.cacheKey)
+
+        return UsageData(
+            service: .cursor,
+            fiveHourUsage: metric,
+            weeklyUsage: nil,
+            lastUpdated: Date(),
+            isAvailable: true,
+            planName: resolvedPlanName()
+        )
+    }
+
+    // MARK: - API Calls
+
+    private func fetchLegacyUsage(userId: String, cookie: String) async throws -> CursorUsageResponse {
         var components = URLComponents(string: Self.apiBaseURL)
         components?.queryItems = [URLQueryItem(name: "user", value: userId)]
         guard let url = components?.url else {
             throw APIError.invalidResponse
         }
-
-        let encodedUserId = Self.percentEncodeCookieComponent(userId)
-        let encodedJWT = Self.percentEncodeCookieComponent(jwt)
-        let cookie = "\(encodedUserId)%3A%3A\(encodedJWT)"
 
         var request = URLRequest(url: url, timeoutInterval: 10)
         request.httpMethod = "GET"
@@ -98,72 +134,69 @@ final class CursorUsageProvider: UsageProviderProtocol, @unchecked Sendable {
         request.setValue("AgentBar", forHTTPHeaderField: "User-Agent")
 
         let (data, response) = try await session.data(for: request)
+        try Self.validate(response)
+        return try JSONDecoder().decode(CursorUsageResponse.self, from: data)
+    }
 
-        guard let httpResponse = response as? HTTPURLResponse else {
+    private func fetchAggregatedSpendCents(cookie: String, since periodStart: Date) async throws -> Double {
+        guard let url = URL(string: Self.aggregatedUsageURL) else {
             throw APIError.invalidResponse
         }
 
+        let body: [String: Any] = [
+            "teamId": -1,
+            "startDate": String(Int(periodStart.timeIntervalSince1970 * 1000)),
+            "endDate": String(Int(Date().timeIntervalSince1970 * 1000))
+        ]
+
+        // Aggregating a full billing period of usage events is slow on a cold
+        // request, so allow more time than the lightweight legacy call.
+        var request = URLRequest(url: url, timeoutInterval: 30)
+        request.httpMethod = "POST"
+        request.setValue("WorkosCursorSessionToken=\(cookie)", forHTTPHeaderField: "Cookie")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // The dashboard API rejects requests without a matching Origin (CSRF guard).
+        request.setValue(Self.dashboardOrigin, forHTTPHeaderField: "Origin")
+        request.setValue("AgentBar", forHTTPHeaderField: "User-Agent")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        try Self.validate(response)
+        return try JSONDecoder().decode(CursorAggregatedUsageResponse.self, from: data).resolvedCents
+    }
+
+    private static func validate(_ response: URLResponse) throws {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw APIError.invalidResponse
+        }
         guard (200...299).contains(httpResponse.statusCode) else {
             if httpResponse.statusCode == 401 {
                 throw APIError.unauthorized
             }
             throw APIError.httpError(httpResponse.statusCode)
         }
+    }
 
-        let usageResponse = try JSONDecoder().decode(CursorUsageResponse.self, from: data)
-
-        // 4. Sum requests across all model buckets
-        let totalRequests = usageResponse.allModelUsages.compactMap(\.numRequests).reduce(0, +)
-
-        // 5. Determine total from maxRequestUsage or plan limit
-        let apiLimit = usageResponse.allModelUsages.compactMap(\.maxRequestUsage).max()
-        let total = Double(apiLimit ?? Int(monthlyRequestLimit))
-
-        // 6. Compute reset time from startOfMonth + 1 month
-        let resetTime: Date?
-        if let startStr = usageResponse.startOfMonth {
-            resetTime = Self.parseStartOfMonthReset(startStr)
-        } else {
-            resetTime = CopilotUsageProvider.firstOfNextMonthUTC()
-        }
-
-        let metric = UsageMetric(
-            used: Double(totalRequests),
-            total: total,
-            unit: .requests,
-            resetTime: resetTime
-        )
-        saveMetricCache(metric, forKey: "cursorUsageCache.monthly")
-
-        let planName = (defaults.string(forKey: "cursorPlan")
+    private func resolvedPlanName() -> String {
+        (defaults.string(forKey: "cursorPlan")
             .flatMap { CursorPlan(rawValue: $0) } ?? .pro).rawValue
-
-        return UsageData(
-            service: .cursor,
-            fiveHourUsage: metric,
-            weeklyUsage: nil,
-            lastUpdated: Date(),
-            isAvailable: true,
-            planName: planName
-        )
     }
 
     // MARK: - Usage Caching
 
     private func cachedOrThrow(_ error: Error) throws -> UsageData {
         let now = Date()
-        guard let cached = validCachedMetric(forKey: "cursorUsageCache.monthly", now: now) else {
+        guard let cached = validCachedMetric(forKey: Self.cacheKey, now: now) else {
             throw error
         }
-        let planName = (defaults.string(forKey: "cursorPlan")
-            .flatMap { CursorPlan(rawValue: $0) } ?? .pro).rawValue
         return UsageData(
             service: .cursor,
             fiveHourUsage: cached,
             weeklyUsage: nil,
             lastUpdated: now,
             isAvailable: true,
-            planName: planName
+            planName: resolvedPlanName()
         )
     }
 
@@ -171,7 +204,7 @@ final class CursorUsageProvider: UsageProviderProtocol, @unchecked Sendable {
         guard defaults.object(forKey: "\(key).used") != nil else { return nil }
         let used = defaults.double(forKey: "\(key).used")
         let total = defaults.object(forKey: "\(key).total") != nil
-            ? defaults.double(forKey: "\(key).total") : monthlyRequestLimit
+            ? defaults.double(forKey: "\(key).total") : monthlyUsageLimitUSD
         let resetTimestamp = defaults.object(forKey: "\(key).resetTime") as? Double
         let resetTime = resetTimestamp.map { Date(timeIntervalSince1970: $0) }
 
@@ -183,7 +216,7 @@ final class CursorUsageProvider: UsageProviderProtocol, @unchecked Sendable {
             clearMetricCache(forKey: key)
             return nil
         }
-        return UsageMetric(used: used, total: total, unit: .requests, resetTime: resetTime)
+        return UsageMetric(used: used, total: total, unit: .dollars, resetTime: resetTime)
     }
 
     private func saveMetricCache(_ metric: UsageMetric, forKey key: String) {
@@ -248,6 +281,13 @@ final class CursorUsageProvider: UsageProviderProtocol, @unchecked Sendable {
 
     // MARK: - Helpers
 
+    /// Builds the `WorkosCursorSessionToken` value: `<userId>::<jwt>`, percent-encoded.
+    static func sessionCookie(userId: String, jwt: String) -> String {
+        let encodedUserId = percentEncodeCookieComponent(userId)
+        let encodedJWT = percentEncodeCookieComponent(jwt)
+        return "\(encodedUserId)%3A%3A\(encodedJWT)"
+    }
+
     static func base64URLDecode(_ string: String) -> Data? {
         var base64 = string
             .replacingOccurrences(of: "-", with: "+")
@@ -271,5 +311,13 @@ final class CursorUsageProvider: UsageProviderProtocol, @unchecked Sendable {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "UTC")!
         return calendar.date(byAdding: .month, value: 1, to: startDate)
+    }
+
+    /// Fallback billing-period start when the API omits `startOfMonth`.
+    static func startOfCurrentMonthUTC() -> Date {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let components = calendar.dateComponents([.year, .month], from: Date())
+        return calendar.date(from: components) ?? Date()
     }
 }
