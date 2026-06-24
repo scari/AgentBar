@@ -19,22 +19,16 @@ final class CursorUsageProviderTests: XCTestCase {
         super.tearDown()
     }
 
-    func testFetchesUsageFromAPI() async throws {
-        // Create a temp SQLite DB with a test JWT
+    func testFetchesDollarUsageFromAggregatedEndpoint() async throws {
         let dbPath = try createTempDB(jwt: makeTestJWT(sub: "user_abc123"))
 
-        let json = """
-        {
-            "startOfMonth": "2026-02-01T00:00:00.000Z",
-            "gpt-4": {"numRequests": 30, "numRequestsTotal": 30, "maxRequestUsage": 500, "numTokens": 50000},
-            "gpt-3.5-turbo": {"numRequests": 10, "numRequestsTotal": 10, "maxRequestUsage": null, "numTokens": 20000},
-            "cursor-small": {"numRequests": 5, "numRequestsTotal": 5, "maxRequestUsage": null, "numTokens": 10000}
-        }
-        """
-        CursorMockURLProtocol.stubResponse(data: Data(json.utf8), statusCode: 200)
+        CursorMockURLProtocol.stub(
+            legacy: #"{"startOfMonth": "2026-02-01T00:00:00.000Z"}"#,
+            aggregated: #"{"totalCostCents": 12345.6, "aggregations": []}"#
+        )
 
         let provider = CursorUsageProvider(
-            monthlyRequestLimit: 500,
+            monthlyUsageLimitUSD: 400,
             session: CursorMockURLProtocol.session(),
             dbPathProvider: { dbPath },
             defaults: testDefaults
@@ -44,22 +38,45 @@ final class CursorUsageProviderTests: XCTestCase {
 
         XCTAssertEqual(usage.service, .cursor)
         XCTAssertTrue(usage.isAvailable)
-        XCTAssertEqual(usage.fiveHourUsage.unit, .requests)
-        XCTAssertEqual(usage.fiveHourUsage.used, 45)   // 30 + 10 + 5
-        XCTAssertEqual(usage.fiveHourUsage.total, 500)  // from maxRequestUsage
+        XCTAssertEqual(usage.fiveHourUsage.unit, .dollars)
+        XCTAssertEqual(usage.fiveHourUsage.used, 123.456, accuracy: 0.0001) // totalCostCents / 100
+        XCTAssertEqual(usage.fiveHourUsage.total, 400)                       // plan USD allotment
         XCTAssertNil(usage.weeklyUsage)
+    }
+
+    func testSumsAggregationsWhenTotalCostCentsMissing() async throws {
+        let dbPath = try createTempDB(jwt: makeTestJWT(sub: "user_sum"))
+
+        // No top-level totalCostCents -> fall back to summing per-model aggregations.
+        CursorMockURLProtocol.stub(
+            legacy: #"{"startOfMonth": "2026-02-01T00:00:00.000Z"}"#,
+            aggregated: #"""
+            {"aggregations": [
+                {"modelIntent": "gpt-5", "totalCents": 1000.0},
+                {"modelIntent": "claude", "totalCents": 250.5}
+            ]}
+            """#
+        )
+
+        let provider = CursorUsageProvider(
+            monthlyUsageLimitUSD: 400,
+            session: CursorMockURLProtocol.session(),
+            dbPathProvider: { dbPath },
+            defaults: testDefaults
+        )
+
+        let usage = try await provider.fetchUsage()
+
+        XCTAssertEqual(usage.fiveHourUsage.used, 12.505, accuracy: 0.0001) // (1000 + 250.5) / 100
     }
 
     func testComputesResetFromStartOfMonth() async throws {
         let dbPath = try createTempDB(jwt: makeTestJWT(sub: "user_xyz"))
 
-        let json = """
-        {
-            "startOfMonth": "2026-02-01T00:00:00.000Z",
-            "gpt-4": {"numRequests": 0, "numRequestsTotal": 0, "maxRequestUsage": 500, "numTokens": 0}
-        }
-        """
-        CursorMockURLProtocol.stubResponse(data: Data(json.utf8), statusCode: 200)
+        CursorMockURLProtocol.stub(
+            legacy: #"{"startOfMonth": "2026-02-01T00:00:00.000Z"}"#,
+            aggregated: #"{"totalCostCents": 0}"#
+        )
 
         let provider = CursorUsageProvider(
             session: CursorMockURLProtocol.session(),
@@ -79,6 +96,26 @@ final class CursorUsageProviderTests: XCTestCase {
         XCTAssertEqual(components.day, 1)
     }
 
+    func testUsesPlanLimitAsTotal() async throws {
+        let dbPath = try createTempDB(jwt: makeTestJWT(sub: "user_total"))
+
+        CursorMockURLProtocol.stub(
+            legacy: #"{"startOfMonth": "2026-02-01T00:00:00.000Z"}"#,
+            aggregated: #"{"totalCostCents": 5000}"#
+        )
+
+        let provider = CursorUsageProvider(
+            monthlyUsageLimitUSD: 60,
+            session: CursorMockURLProtocol.session(),
+            dbPathProvider: { dbPath },
+            defaults: testDefaults
+        )
+
+        let usage = try await provider.fetchUsage()
+
+        XCTAssertEqual(usage.fiveHourUsage.total, 60)
+    }
+
     func testHandlesMissingDatabase() async {
         let provider = CursorUsageProvider(
             dbPathProvider: { "/nonexistent/path/state.vscdb" },
@@ -89,28 +126,32 @@ final class CursorUsageProviderTests: XCTestCase {
         XCTAssertFalse(isConfigured)
     }
 
-    func testHandlesNullMaxRequestUsage() async throws {
-        let dbPath = try createTempDB(jwt: makeTestJWT(sub: "user_test"))
+    func testSendsRequiredOriginHeaderOnAggregatedRequest() async throws {
+        let dbPath = try createTempDB(jwt: makeTestJWT(sub: "user_origin"))
 
-        let json = """
-        {
-            "startOfMonth": "2026-02-01T00:00:00.000Z",
-            "gpt-4": {"numRequests": 100, "numRequestsTotal": 100, "maxRequestUsage": null, "numTokens": 0}
-        }
-        """
-        CursorMockURLProtocol.stubResponse(data: Data(json.utf8), statusCode: 200)
+        CursorMockURLProtocol.stub(
+            legacy: #"{"startOfMonth": "2026-02-01T00:00:00.000Z"}"#,
+            aggregated: #"{"totalCostCents": 100}"#
+        )
 
         let provider = CursorUsageProvider(
-            monthlyRequestLimit: 500,
             session: CursorMockURLProtocol.session(),
             dbPathProvider: { dbPath },
             defaults: testDefaults
         )
 
-        let usage = try await provider.fetchUsage()
+        _ = try await provider.fetchUsage()
 
-        // When maxRequestUsage is null, should fall back to plan limit
-        XCTAssertEqual(usage.fiveHourUsage.total, 500)
+        // The dashboard endpoint rejects requests without a matching Origin (CSRF guard).
+        let aggregatedRequest = CursorMockURLProtocol.capturedRequests.first {
+            $0.url?.absoluteString.contains("aggregated-usage-events") == true
+        }
+        XCTAssertNotNil(aggregatedRequest)
+        XCTAssertEqual(aggregatedRequest?.httpMethod, "POST")
+        XCTAssertEqual(aggregatedRequest?.value(forHTTPHeaderField: "Origin"), "https://cursor.com")
+        XCTAssertTrue(
+            aggregatedRequest?.value(forHTTPHeaderField: "Cookie")?.hasPrefix("WorkosCursorSessionToken=") == true
+        )
     }
 
     func testEncodesReservedCharactersInUserAndCookieHeader() async throws {
@@ -118,18 +159,13 @@ final class CursorUsageProviderTests: XCTestCase {
         let jwt = makeTestJWT(sub: userId)
         let dbPath = try createTempDB(jwt: jwt)
 
-        let json = """
-        {
-            "startOfMonth": "2026-02-01T00:00:00.000Z",
-            "gpt-4": {"numRequests": 1, "numRequestsTotal": 1, "maxRequestUsage": 500, "numTokens": 100}
-        }
-        """
-        CursorMockURLProtocol.stubResponse(data: Data(json.utf8), statusCode: 200)
+        CursorMockURLProtocol.stub(
+            legacy: #"{"startOfMonth": "2026-02-01T00:00:00.000Z"}"#,
+            aggregated: #"{"totalCostCents": 1}"#
+        )
         CursorMockURLProtocol.onRequest = { request in
-            guard let url = request.url else {
-                XCTFail("Missing request URL")
-                return
-            }
+            // Only assert on the legacy GET, which carries the `user` query item.
+            guard let url = request.url, url.path.contains("/api/usage") else { return }
 
             let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
             let queryUserId = components?.queryItems?.first(where: { $0.name == "user" })?.value
@@ -150,54 +186,6 @@ final class CursorUsageProviderTests: XCTestCase {
         )
 
         _ = try await provider.fetchUsage()
-    }
-
-    func testIncludesUnknownModelBucketsInTotals() async throws {
-        let dbPath = try createTempDB(jwt: makeTestJWT(sub: "user_dynamic"))
-
-        let json = """
-        {
-            "startOfMonth": "2026-02-01T00:00:00.000Z",
-            "gpt-4": {"numRequests": 11, "numRequestsTotal": 11, "maxRequestUsage": null, "numTokens": 1000},
-            "gpt-4.1-mini": {"numRequests": 7, "numRequestsTotal": 7, "maxRequestUsage": null, "numTokens": 700}
-        }
-        """
-        CursorMockURLProtocol.stubResponse(data: Data(json.utf8), statusCode: 200)
-
-        let provider = CursorUsageProvider(
-            monthlyRequestLimit: 500,
-            session: CursorMockURLProtocol.session(),
-            dbPathProvider: { dbPath },
-            defaults: testDefaults
-        )
-
-        let usage = try await provider.fetchUsage()
-
-        XCTAssertEqual(usage.fiveHourUsage.used, 18)
-    }
-
-    func testUsesMaximumMaxRequestUsageAcrossBuckets() async throws {
-        let dbPath = try createTempDB(jwt: makeTestJWT(sub: "user_limits"))
-
-        let json = """
-        {
-            "startOfMonth": "2026-02-01T00:00:00.000Z",
-            "gpt-4": {"numRequests": 10, "numRequestsTotal": 10, "maxRequestUsage": 200, "numTokens": 1000},
-            "claude-3.5-sonnet": {"numRequests": 2, "numRequestsTotal": 2, "maxRequestUsage": 800, "numTokens": 500}
-        }
-        """
-        CursorMockURLProtocol.stubResponse(data: Data(json.utf8), statusCode: 200)
-
-        let provider = CursorUsageProvider(
-            monthlyRequestLimit: 500,
-            session: CursorMockURLProtocol.session(),
-            dbPathProvider: { dbPath },
-            defaults: testDefaults
-        )
-
-        let usage = try await provider.fetchUsage()
-
-        XCTAssertEqual(usage.fiveHourUsage.total, 800)
     }
 
     func testJWTDecoding() throws {
@@ -259,20 +247,34 @@ final class CursorUsageProviderTests: XCTestCase {
 
 // MARK: - Mock URL Protocol
 
+/// Routes the provider's two calls to separate stubs: the legacy `/api/usage` GET and
+/// the `dashboard/get-aggregated-usage-events` POST.
 private final class CursorMockURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var stubData: Data = Data()
-    nonisolated(unsafe) static var stubStatusCode: Int = 200
+    struct Stub {
+        var data: Data
+        var status: Int
+    }
+
+    nonisolated(unsafe) static var legacyStub = Stub(data: Data(), status: 200)
+    nonisolated(unsafe) static var aggregatedStub = Stub(data: Data(), status: 200)
+    nonisolated(unsafe) static var capturedRequests: [URLRequest] = []
     nonisolated(unsafe) static var onRequest: ((URLRequest) -> Void)?
 
     static func reset() {
-        stubData = Data()
-        stubStatusCode = 200
+        legacyStub = Stub(data: Data(), status: 200)
+        aggregatedStub = Stub(data: Data(), status: 200)
+        capturedRequests = []
         onRequest = nil
     }
 
-    static func stubResponse(data: Data, statusCode: Int) {
-        stubData = data
-        stubStatusCode = statusCode
+    static func stub(
+        legacy: String,
+        legacyStatus: Int = 200,
+        aggregated: String,
+        aggregatedStatus: Int = 200
+    ) {
+        legacyStub = Stub(data: Data(legacy.utf8), status: legacyStatus)
+        aggregatedStub = Stub(data: Data(aggregated.utf8), status: aggregatedStatus)
     }
 
     static func session() -> URLSession {
@@ -281,21 +283,30 @@ private final class CursorMockURLProtocol: URLProtocol, @unchecked Sendable {
         return URLSession(configuration: config)
     }
 
+    private static func isAggregated(_ request: URLRequest) -> Bool {
+        request.url?.absoluteString.contains("aggregated-usage-events") ?? false
+    }
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
+        CursorMockURLProtocol.capturedRequests.append(request)
         CursorMockURLProtocol.onRequest?(request)
+
+        let stub = CursorMockURLProtocol.isAggregated(request)
+            ? CursorMockURLProtocol.aggregatedStub
+            : CursorMockURLProtocol.legacyStub
 
         let response = HTTPURLResponse(
             url: request.url!,
-            statusCode: CursorMockURLProtocol.stubStatusCode,
+            statusCode: stub.status,
             httpVersion: nil,
             headerFields: nil
         )!
 
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: CursorMockURLProtocol.stubData)
+        client?.urlProtocol(self, didLoad: stub.data)
         client?.urlProtocolDidFinishLoading(self)
     }
 
